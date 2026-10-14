@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 import "Run.js" as Run
@@ -29,10 +30,10 @@ Panel {
 
   // Rule 15: the bar's injected palette, bound once here and passed down, so a bar with its own
   // colours stays coherent inside the card.
-  readonly property color foreground: root.bar ? root.bar.foreground : Color.popups.text
+  readonly property color foreground: root.bar ? root.bar.foreground : Commons.Color.popups.text
   // One grey for the whole panel, at the factor the OEM agents panel calls dim.
   readonly property color muted: Qt.darker(root.foreground, 1.55)
-  readonly property color urgentColor: root.bar ? root.bar.urgent : Color.urgent
+  readonly property color urgentColor: root.bar ? root.bar.urgent : Commons.Color.urgent
   // The bar's own face, the way every OEM panel takes it: a card in Style.font.family beside panels
   // in the bar's family reads as a different application.
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
@@ -236,7 +237,7 @@ Panel {
           anchors.centerIn: parent
           // Rule 4: accent is transient and supporting, never the resting colour.
           color: root.landAccent > 0
-                 ? Qt.tint(root.barForeground, Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, root.landAccent))
+                 ? Qt.tint(root.barForeground, Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, root.landAccent))
                  : root.barForeground
           opacity: root.markOpacity
           // Rule 2's only channel, and Land's 220 ms is the step it takes to full presence.
@@ -256,6 +257,11 @@ Panel {
     }
   }
 
+  // Issue 255 (liri2006): the card maps above the rail, so its mask cuts the rail's strip or a dwell-opened drop is lost.
+  readonly property var railCut: Model.railStrip(rail.edge, panel.screenW, panel.screenH,
+                                                 rail.visible ? rail.implicitWidth : 0,
+                                                 rail.visible ? rail.implicitHeight : 0)
+
   // Rule 2 and directive 64: the card is hosted by the shell's own popup host, so a click anywhere
   // outside it, a focus loss or esc closes it, and opening another panel closes it, exactly as the
   // Dropbox and Tailscale panels behave.
@@ -274,6 +280,13 @@ Panel {
     mask: Region {
       width: root.carrying ? 0 : panel.screenW
       height: root.carrying ? 0 : panel.screenH
+      Region {
+        x: root.railCut.x
+        y: root.railCut.y
+        width: root.railCut.width
+        height: root.railCut.height
+        intersection: Intersection.Subtract
+      }
     }
 
     // The shelf's own key catcher rather than Ui/PanelKeyCatcher: that one turns keys into semantic

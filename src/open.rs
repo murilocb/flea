@@ -1,4 +1,5 @@
 use crate::gui;
+use crate::runfile;
 use crate::tearoff;
 use crate::thp;
 use crate::vulkan;
@@ -15,12 +16,38 @@ fn resolved(path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-// gio open is the OEM route: it asks the desktop database, so Terminal=true is honoured; see AGENTS.md "Opening a file".
+// The environment every program Flea starts carries: huge pages back on, Qt's own pin, driver exclusion and theme dropped, the tear-off hand-off kept to its window. runfile.rs reuses this.
+pub fn prepare(child: &mut Command) {
+    // The setting is inherited across exec, so this is the last point that can hand it back.
+    thp::enable();
+    // The display-GPU pin and the driver exclusion are Qt's alone, and only this launcher's own are dropped.
+    vulkan::drop_display_pin(child);
+    crate::icdexclude::drop_exclusion(child);
+    // The platform theme Flea traded for its own startup is Qt's alone too, and is handed back here.
+    gui::restore_platform_theme(child);
+    // The tear-off hand-off belongs to the one window a tear-off starts, never to a program it opens.
+    tearoff::drop_env(child);
+}
+
+// In-process callers (the TUI, the shelf) stay on 0/2/3: an executable is refused with its sentence, and only the main.rs --open path asks the card, through open_all.
 pub fn open(path: &str) -> i32 {
+    open_inner(&[path.to_string()], false)
+}
+
+// The one-path spelling of the window's entrance the open tests drive; the binary itself always
+// reaches open_all, whose variadic tail takes one path or more.
+#[cfg(test)]
+pub fn open_ask(path: &str) -> i32 {
     open_all(&[path.to_string()])
 }
 
+// The window's entrance for one path or more, which asks the run card; in-process callers use open::open.
 pub fn open_all(paths: &[String]) -> i32 {
+    open_inner(paths, true)
+}
+
+// gio open is the OEM route: it asks the desktop database, so Terminal=true is honoured; see AGENTS.md "Opening a file".
+fn open_inner(paths: &[String], ask: bool) -> i32 {
     if paths.is_empty() {
         return FAILED;
     }
@@ -28,8 +55,8 @@ pub fn open_all(paths: &[String]) -> i32 {
     for path in paths {
         match resolved(path) {
             Some(p) => targets.push(p),
+            // The reason is elided, never shown raw, and the path is the user's own input.
             None => {
-                // The reason is elided, never shown raw, and the path is the user's own input.
                 eprintln!("flea: that file could not be opened, check that it still exists");
                 return FAILED;
             }
@@ -42,41 +69,117 @@ pub fn open_all(paths: &[String]) -> i32 {
         eprintln!("flea: directories cannot be opened alongside files");
         return FAILED;
     }
-    // The setting is inherited across exec, so this is the last point that can hand it back.
-    thp::enable();
-    if targets.len() > 1 {
-        if let Some(plan) = batch_plan(&targets) {
-            let mut refused = false;
-            for (desktop, files) in plan {
-                let mut args: Vec<&Path> = Vec::with_capacity(files.len() + 1);
-                args.push(&desktop);
-                for file in &files {
-                    args.push(file);
-                }
-                if run_gio("launch", &args) != 0 {
-                    refused = true;
-                }
-            }
-            if refused {
-                eprintln!("flea: gio launch refused part of that selection, so some of it did not open");
+    // Every target takes the per-file run decision, so a batch is refused whole for the same
+    // reasons one path is. A FIFO, socket or device is never a program and never blocks here: it
+    // skips the snapshot and the run decision and opens the way it always did.
+    for target in &targets {
+        if !target.is_file() {
+            continue;
+        }
+        // One open for the kind and the identity together, so a swap between them cannot pair two files.
+        let opened = match crate::runid::snapshot(target) {
+            Some(o) => o,
+            None => {
+                eprintln!("flea: that file could not be opened, check that it still exists");
                 return FAILED;
             }
-            return 0;
+        };
+        // A program asks once on the run card instead of reaching a handler, and a file no application claims asks Open with.
+        let body = std::fs::read("/proc/self/mountinfo").unwrap_or_default();
+        let mounts = String::from_utf8_lossy(&body).into_owned();
+        match runfile::decide_opened(&opened, target, &mounts) {
+            runfile::Decision::Ask(kind) => {
+                // The card is single-flight and ask_line carries one identity, so only a lone path asks it.
+                if ask && paths.len() == 1 {
+                    let handler = if matches!(kind, runfile::Kind::AppImage) { crate::desktopid::handler(target) } else { None };
+                    println!("{}", runfile::ask_line(kind, handler.as_ref(), &opened.id, target));
+                    return runfile::ASK_RUN;
+                }
+                // A batch names the batch, the way the directory refusal above does.
+                if paths.len() == 1 {
+                    eprintln!("flea: that file is a program, so it was not opened");
+                } else {
+                    eprintln!("flea: a program opens on its own, one at a time, so nothing in that selection was opened");
+                }
+                return FAILED;
+            }
+            // A script missing its bit opens with its handler the way it always did; the menu's Make executable is the one route to the bit.
+            runfile::Decision::MakeExecutable(runfile::Kind::Script) => {}
+            // A binary missing its bit is refused for every caller, since an AppImage launcher would run it.
+            runfile::Decision::MakeExecutable(_) => {
+                eprintln!("flea: that file is a program, so it was not opened");
+                return FAILED;
+            }
+            runfile::Decision::RefuseNoExec => {
+                eprintln!("flea: that program is on a volume that does not allow running files");
+                return FAILED;
+            }
+            runfile::Decision::OpenNormally => {}
         }
     }
-    let mut args: Vec<&Path> = Vec::with_capacity(targets.len());
-    for target in &targets {
-        args.push(target);
+    // More than one target is launched grouped by handler; a type with no handler leaves the whole
+    // batch on the gio open route rather than opening part of a selection.
+    if targets.len() > 1 {
+        if let Some(plan) = batch_plan(&targets) {
+            return launch_groups(&plan);
+        }
     }
-    let status = run_gio("open", &args);
-    match status {
-        0 => 0,
+    open_normally(&targets, ask)
+}
+
+// Past every run decision: handed to gio open and waited on, the way the opener always did.
+fn open_normally(targets: &[PathBuf], ask: bool) -> i32 {
+    // corner: waited for, not detached, and on an archive that wait is a cold handler start; see AGENTS.md "Opening a file".
+    let mut launcher = Command::new("gio");
+    prepare(&mut launcher);
+    let finished = launcher
+        .arg("open")
+        .args(targets)
+        // The handler outlives us, so an inherited pipe would kill it on its first write; see AGENTS.md "Opening a file".
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Its own process group, so nothing that later kills Flea's group reaches the opened program.
+        .process_group(0)
+        .status();
+    match finished {
+        Ok(status) if status.success() => 0,
         // A launcher that refused, which a spawn nobody waited on used to report as a clean handoff.
-        _ => {
-            eprintln!("flea: gio open refused that file, so no application on this system took it");
+        Ok(_) => {
+            // A file no application claims opens the approved Open with dialog instead, on the window's path alone.
+            if ask && targets.len() == 1 && crate::desktopid::unclaimed(&targets[0]) {
+                println!(r#"{{"ask":"openWith"}}"#);
+                return runfile::ASK_OPEN_WITH;
+            }
+            eprintln!("flea: no application on this system opened that file");
+            FAILED
+        }
+        Err(_) => {
+            eprintln!("flea: nothing on this system could be asked to open that file");
             FAILED
         }
     }
+}
+
+// Each group is one gio launch of the desktop file the database named and the files that share it,
+// and a refusal anywhere refuses the whole selection's answer.
+fn launch_groups(groups: &[(PathBuf, Vec<PathBuf>)]) -> i32 {
+    let mut refused = false;
+    for (desktop, files) in groups {
+        let mut args: Vec<&Path> = Vec::with_capacity(files.len() + 1);
+        args.push(desktop);
+        for file in files {
+            args.push(file);
+        }
+        if run_gio("launch", &args) != 0 {
+            refused = true;
+        }
+    }
+    if refused {
+        eprintln!("flea: gio launch refused part of that selection, so some of it did not open");
+        return FAILED;
+    }
+    0
 }
 
 // gio open starts the handler once per file, so a selection of N opened N programs where
@@ -147,12 +250,9 @@ fn desktop_file(mime: &str) -> Option<PathBuf> {
 // Every route is one gio invocation, so the guards Flea hands back and the exit status live here.
 fn run_gio(verb: &str, args: &[&Path]) -> i32 {
     let mut launcher = Command::new("gio");
-    // The display-GPU pin is Qt's alone, and only this launcher's own pin is dropped.
-    vulkan::drop_display_pin(&mut launcher);
-    // The platform theme Flea traded for its own startup is Qt's alone too, and is handed back here.
-    gui::restore_platform_theme(&mut launcher);
-    // The tear-off hand-off belongs to the one window a tear-off starts, never to a program it opens.
-    tearoff::drop_env(&mut launcher);
+    // The huge page setting, the display-GPU pin, the driver exclusion, the theme trade and the
+    // tear-off hand-off are the one set of guards every program Flea starts carries, in prepare().
+    prepare(&mut launcher);
     launcher.arg(verb);
     launcher.args(args);
     // corner: waited for, not detached, and on an archive that wait is a cold handler start; see AGENTS.md "Opening a file".
@@ -166,35 +266,14 @@ fn run_gio(verb: &str, args: &[&Path]) -> i32 {
         .status()
     {
         Ok(status) if status.success() => 0,
-        Ok(_) => FAILED,
-        Err(_) => {
-            eprintln!("flea: nothing on this system could be asked to open that file");
+        // A launcher that refused, which a spawn nobody waited on used to report as a clean handoff.
+        _ => {
+            eprintln!("flea: gio {} refused that file, so no application on this system took it", verb);
             FAILED
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_all_rejects_empty_paths() {
-        assert_eq!(open_all(&[]), FAILED);
-    }
-
-    #[test]
-    fn open_all_rejects_nonexistent_file() {
-        assert_eq!(open_all(&["/nonexistent_file_path_xyz123".to_string()]), FAILED);
-    }
-
-    #[test]
-    fn open_all_single_directory_returns_is_directory() {
-        assert_eq!(open_all(&["/".to_string()]), IS_DIRECTORY);
-    }
-
-    #[test]
-    fn open_all_multiple_with_directory_fails() {
-        assert_eq!(open_all(&["/".to_string(), "/etc".to_string()]), FAILED);
-    }
-}
+#[path = "open_tests.rs"]
+mod tests;
