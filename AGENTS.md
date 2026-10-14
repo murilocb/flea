@@ -7137,7 +7137,7 @@ reads; measured here, all eight extensions in `ui/js/Archive.js` resolve through
 `/usr/share/mime/globs2` to a type whose `/usr/share/mime/generic-icons` row is `package-x-generic`,
 and so do `.deb`, `.rpm`, `.jar`, `.cab`, `.gz` and `.xz`.
 
-**Enter on a selection opens every marked file, and two rows refuse the whole batch.** The rule was
+**Enter on a selection opens every marked file, and a mixed selection refuses the whole batch.** The rule was
 missing at three layers at once, so no two files could ever reach a handler: `Nav.openCursor` read
 only `pane.cursorIndex`, `ui/Opener.qml` built a fixed `[bin, "--open", path]`, and `main.rs` matched
 `--open` only at `args.len() == 3`. `gio open` has always taken `LOCATION…`, so the fix is one
@@ -7145,13 +7145,18 @@ variadic batch end to end. A selection holding a directory refuses with `Directo
 alongside files.`, and one holding an archive refuses with `Archives open on their own, one at a time.`,
 because the ruling above is a VIEW and a mixed batch has no single view to show, while handing the
 archive to the desktop handler is exactly the outcome that ruling exists to prevent. A selected row
-outside the pane's held window is the third refusal, `Some selected files are outside the loaded rows.`,
+outside the pane's held window is a third refusal, `Some selected files are outside the loaded rows.`,
 because `rowFor` answers `null` outside `[held, held + rows.length)` and a selection of a 100,000-row
 listing holds every index while only a screenful of rows is in memory; skipping the nulls opened the
-visible part and said nothing, which is the very defect the batch is meant to fix. `src/open.rs`
-`open_all` carries the same refusal at the CLI, with its own `flea:` sentence naming the mixed batch,
-never the missing-file one. The TUI's `open` has no Quick Look surface, so it keeps handing an archive
-to the desktop handler and refuses only the directory.
+visible part and said nothing, which is the very defect the batch is meant to fix. A fourth is a
+program in the selection, `a program opens on its own, one at a time.`, because the run card is
+single-flight: `ui/Opener.qml` holds one `root.current` and `runfile::ask_line` carries one identity, so
+a batch of twelve files cannot be asked about at all. Refusing the batch is the same shape as the
+directory and archive refusals and the same rule `batch_plan` already follows: never open part of a
+selection. A lone file still reaches the card with `4`, which the ask tests in `src/open_tests.rs` pin.
+`src/open.rs` `open_all` carries the same refusals at the CLI, each with its own `flea:` sentence
+naming the mixed batch, never the missing-file one. The TUI's `open` has no Quick Look surface, so it
+keeps handing an archive to the desktop handler and refuses only the directory.
 
 **That one icon covers the whole Nautilus class on this box, derived rather than assumed.**
 `org.gnome.Nautilus.desktop` lists 26 `MimeType` entries; 25 resolve to it as the default and the
